@@ -6,21 +6,22 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
+    name: Build ${{ matrix.label }} APK
     runs-on: ubuntu-latest
-
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: arm64
-            label: arm64
+          - label: arm64
             abi: arm64-v8a
-          - target: armeabi
-            label: armeabi
+          - label: armeabi
             abi: armeabi-v7a
-          - target: universal
-            label: universal
+          - label: universal
             abi: ''
 
     steps:
@@ -51,155 +52,91 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Capacitor CLI
-        run: npm install -D @capacitor/cli @capacitor/core @capacitor/android
-
-      - name: Add Android platform
-        run: npx cap add android || true
-
-      - name: Sync web assets
-        run: npx cap sync android
-
-      - name: Patch build.gradle for ABI splits
-        working-directory: android
+      - name: Sync Capacitor Android project
         run: |
-          if [ -f app/build.gradle ]; then
-            GRADLE_FILE="app/build.gradle"
-          elif [ -f app/build.gradle.kts ]; then
-            GRADLE_FILE="app/build.gradle.kts"
-          else
-            echo "No build.gradle found!"
-            find . -name "build.gradle*" -maxdepth 3
+          npx cap add android || true
+          npx cap sync android
+
+      - name: Configure ABI split
+        if: matrix.abi != ''
+        working-directory: android
+        env:
+          TARGET_ABI: ${{ matrix.abi }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          path = Path('app/build.gradle')
+          if not path.exists():
+              raise SystemExit('android/app/build.gradle was not generated')
+
+          content = path.read_text()
+          abi = os.environ['TARGET_ABI']
+          block = f'''\n    splits {{\n        abi {{\n            enable true\n            reset()\n            include "{abi}"\n            universalApk false\n        }}\n    }}\n'''
+
+          if 'splits {' not in content:
+              content = content.replace('android {', 'android {' + block, 1)
+              path.write_text(content)
+          PY
+
+      - name: Build installable debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Collect APK
+        env:
+          VERSION: ${{ github.ref_name }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -e
+          OUTPUT="V2rayAG-${LABEL}-${VERSION}.apk"
+          APK=$(find android/app/build/outputs/apk/debug -type f -name '*.apk' | sort | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "No debug APK was generated"
+            find android/app/build/outputs -type f || true
             exit 1
           fi
+          cp "$APK" "$OUTPUT"
+          ls -lh "$OUTPUT"
 
-          if [ "${{ matrix.abi }}" != "" ]; then
-            python3 -c "
-          import re
-          with open('$GRADLE_FILE', 'r') as f:
-              content = f.read()
-          splits_block = '''
-              splits {
-                  abi {
-                      enable true
-                      reset()
-                      include \"${{ matrix.abi }}\"
-                      universalApk false
-                  }
-              }
-          '''
-          content = re.sub(r'android\s*\{', 'android {\n' + splits_block, content, count=1)
-          with open('$GRADLE_FILE', 'w') as f:
-              f.write(content)
-          "
-          fi
-
-      - name: Build release APK
-        working-directory: android
-        run: ./gradlew assembleRelease
-
-      - name: Sign APK (if signing key is configured)
-        id: sign_app
-        if: ${{ secrets.ANDROID_SIGNING_KEY != '' }}
-        uses: r0adkll/sign-android-release@v1
-        with:
-          releaseDirectory: android/app/build/outputs/apk/release
-          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
-          alias: ${{ secrets.ANDROID_KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
-          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        env:
-          BUILD_TOOLS_VERSION: "34.0.0"
-
-      - name: Build debug APK (fallback when no signing key)
-        if: ${{ secrets.ANDROID_SIGNING_KEY == '' }}
-        working-directory: android
-        run: ./gradlew assembleDebug
-
-      - name: Collect and rename APK
-        run: |
-          VERSION="${{ github.ref_name || 'v1.0.0' }}"
-          LABEL="${{ matrix.label }}"
-          OUTPUT_FILE="V2rayAG-${LABEL}-${VERSION}.apk"
-
-          # Try signed release first
-          SIGNED_FILE="${{ steps.sign_app.outputs.signedReleaseFile }}"
-          if [ -f "$SIGNED_FILE" ]; then
-            cp "$SIGNED_FILE" "$OUTPUT_FILE"
-            echo "Using signed release APK"
-          else
-            # Find any release APK
-            RELEASE_APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
-            if [ -n "$RELEASE_APK" ] && [ -f "$RELEASE_APK" ]; then
-              cp "$RELEASE_APK" "$OUTPUT_FILE"
-              echo "Using unsigned release APK: $RELEASE_APK"
-            else
-              # Fallback to debug
-              DEBUG_APK=$(find android/app/build/outputs/apk/debug -name "*.apk" | head -1)
-              if [ -n "$DEBUG_APK" ] && [ -f "$DEBUG_APK" ]; then
-                cp "$DEBUG_APK" "$OUTPUT_FILE"
-                echo "Using debug APK: $DEBUG_APK"
-              else
-                echo "No APK found!"
-                find android/app/build/outputs -name "*.apk" || true
-                exit 1
-              fi
-            fi
-          fi
-
-          ls -lh "$OUTPUT_FILE"
-          echo "APK_FILE=$OUTPUT_FILE" >> $GITHUB_ENV
-
-      - name: Upload artifact
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: V2rayAG-${{ matrix.label }}
           path: V2rayAG-${{ matrix.label }}-*.apk
+          if-no-files-found: error
 
   release:
+    name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
+      - name: Download APK artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: true
 
-      - name: List artifacts
-        run: find artifacts -name "*.apk" -exec ls -lh {} \;
+      - name: List APK files
+        run: find artifacts -type f -name '*.apk' -exec ls -lh {} \;
 
-      - name: Create Release
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'v1.0.0' }}
-          name: V2rayAG ${{ github.ref_name || 'v1.0.0' }}
+          tag_name: ${{ github.ref_name }}
+          name: V2rayAG ${{ github.ref_name }}
+          generate_release_notes: true
           body: |
             ## V2rayAG Dashboard APK
 
-            دانلود و نصب فایل APK مناسب پردازنده گوشی خود را انتخاب کنید.
+            نسخه مناسب پردازنده گوشی خود را دانلود کنید.
 
-            ### نسخه‌ها:
-            | فایل | پردازنده | مناسب برای |
-            |------|----------|-----------|
-            | `arm64` | ARM 64-bit | گوشی‌های جدید (Samsung، Xiaomi، Pixel و...) |
-            | `armeabi` | ARM 32-bit | گوشی‌های قدیمی‌تر |
-            | `universal` | همه | هر گوشی (حجم بیشتر) |
+            - **arm64**: گوشی‌های جدید ۶۴ بیتی
+            - **armeabi**: گوشی‌های قدیمی ۳۲ بیتی
+            - **universal**: سازگار با همه گوشی‌ها، با حجم بیشتر
 
-            ### راهنمای نصب:
-            ۱. فایل APK مناسب گوشی خود را دانلود کنید
-            ۲. در تنظیمات اندروید «نصب از منابع ناشناخته» را فعال کنید
-            ۳. فایل را باز و نصب کنید
-
-            > اگر نمی‌دانید کدام نسخه را دانلود کنید، نسخه **universal** را انتخاب کنید.
-          files: |
-            artifacts/*/V2rayAG-*.apk
+            اگر نوع پردازنده را نمی‌دانید، نسخه **universal** را نصب کنید.
+          files: artifacts/*.apk
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
