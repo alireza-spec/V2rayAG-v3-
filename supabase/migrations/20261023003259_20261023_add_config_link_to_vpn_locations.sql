@@ -1,0 +1,1 @@
+ALTER TABLE public.vpn_locations ADD COLUMN IF NOT EXISTS config_link text;

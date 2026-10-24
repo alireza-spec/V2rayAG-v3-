@@ -1,0 +1,12 @@
+{
+  "appId": "com.v2rayag.dashboard",
+  "appName": "V2rayAG",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#f7f8f5"
+  }
+}
