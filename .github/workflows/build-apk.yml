@@ -53,9 +53,7 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Sync Capacitor Android project
-        run: |
-          npx cap add android || true
-          npx cap sync android
+        run: npx cap sync android
 
       - name: Configure ABI split
         if: matrix.abi != ''
@@ -65,22 +63,35 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import os
+          import os, re
 
           path = Path('app/build.gradle')
           if not path.exists():
-              raise SystemExit('android/app/build.gradle was not generated')
+              raise SystemExit('android/app/build.gradle not found')
 
           content = path.read_text()
           abi = os.environ['TARGET_ABI']
-          block = f'''\n    splits {{\n        abi {{\n            enable true\n            reset()\n            include "{abi}"\n            universalApk false\n        }}\n    }}\n'''
 
-          if 'splits {' not in content:
-              content = content.replace('android {', 'android {' + block, 1)
-              path.write_text(content)
+          # حذف بلاک splits قبلی اگه وجود داشت
+          content = re.sub(r'\n\s*splits\s*\{[^}]*\}\s*\n', '\n', content, flags=re.DOTALL)
+
+          block = f'''
+    splits {{
+        abi {{
+            enable true
+            reset()
+            include "{abi}"
+            universalApk false
+        }}
+    }}
+'''
+          content = content.replace('android {', 'android {' + block, 1)
+          path.write_text(content)
+          print('--- Modified build.gradle ---')
+          print(content)
           PY
 
-      - name: Build installable debug APK
+      - name: Build APK
         working-directory: android
         run: ./gradlew assembleDebug --no-daemon
 
@@ -91,14 +102,14 @@ jobs:
         run: |
           set -e
           OUTPUT="V2rayAG-${LABEL}-${VERSION}.apk"
-          APK=$(find android/app/build/outputs/apk/debug -type f -name '*.apk' | sort | head -n 1)
+          APK=$(find app/build/outputs/apk/debug -type f -name '*.apk' | sort | head -n 1)
           if [ -z "$APK" ]; then
             echo "No debug APK was generated"
-            find android/app/build/outputs -type f || true
+            find app/build/outputs -type f || true
             exit 1
           fi
-          cp "$APK" "$OUTPUT"
-          ls -lh "$OUTPUT"
+          cp "$APK" "../$OUTPUT"
+          ls -lh "../$OUTPUT"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -117,9 +128,6 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-
-      - name: List APK files
-        run: find artifacts -type f -name '*.apk' -exec ls -lh {} \;
 
       - name: Publish Release
         uses: softprops/action-gh-release@v2
